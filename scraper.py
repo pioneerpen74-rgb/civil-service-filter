@@ -1,13 +1,12 @@
 import csv
 import re
-import urllib.parse
 from playwright.sync_api import sync_playwright
 
-# --- YOUR FILTER CRITERIA ---
-# Words that MUST appear in the job title or description (leave empty [] to accept all)
+# --- CRITERIA ---
+# Must contain any of these keywords (leave empty to match all within your base search)
 MUST_CONTAIN = []
 
-# Words to EXCLUDE (dealsbreakers)
+# Exclude jobs containing any of these keywords
 MUST_NOT_CONTAIN = [
     "veterinary",
     "clinical",
@@ -18,60 +17,94 @@ def run():
     print("Launching browser...")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        page = context.new_page()
 
-        # Load Civil Service Search directly
-        print("Navigating to Civil Service Jobs...")
-        page.goto("https://www.civilservicejobs.service.gov.uk/csr/index.cgi", wait_until="networkidle")
+        print("Navigating to Civil Service search page...")
+        page.goto("https://www.civilservicejobs.service.gov.uk/csr/index.cgi?pageaction=searchcontext&pageclass=Search", wait_until="networkidle")
 
-        # Fill search filters
+        # Accept cookies if banner appears
+        try:
+            cookie_btn = page.locator("button:has-text('Accept'), button:has-text('agree'), input[value*='Accept']")
+            if cookie_btn.count() > 0:
+                cookie_btn.first.click()
+                page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+        # Fill search parameters
         try:
             # Location
-            if page.locator("input#search_location").count() > 0:
-                page.fill("input#search_location", "London")
-            elif page.locator("input[name='search_location']").count() > 0:
-                page.fill("input[name='search_location']", "London")
-            
-            # Submit search
-            page.keyboard.press("Enter")
-            page.wait_for_timeout(5000)
+            loc_input = page.locator("input[name*='location'], input[id*='location']").first
+            if loc_input.count() > 0:
+                loc_input.fill("London")
+
+            # Distance: select 10 miles if dropdown exists
+            dist_select = page.locator("select[name*='radius'], select[id*='distance'], select[name*='distance']").first
+            if dist_select.count() > 0:
+                dist_select.select_option(label=re.compile(r"10\s*miles?", re.I))
+
+            # Salary min (£40,000)
+            sal_input = page.locator("input[name*='minsalary'], input[id*='salary'], input[name*='salary']").first
+            if sal_input.count() > 0:
+                sal_input.fill("40000")
+
+            # Submit form
+            submit_btn = page.locator("input[type='submit'][value*='Search'], button[type='submit']:has-text('Search')").first
+            if submit_btn.count() > 0:
+                submit_btn.click()
+            else:
+                page.keyboard.press("Enter")
+
+            page.wait_for_timeout(6000)
         except Exception as e:
-            print(f"Filter interaction notice: {e}")
+            print(f"Notice during search setup: {e}")
 
-        # Extract listings
+        # Parse listings
+        print(f"Current URL: {page.url}")
         jobs = []
-        cards = page.locator(".search-results-job-box, .job-search-result, tr.search-result").all()
-        print(f"Found {len(cards)} raw listings on page.")
 
-        for card in cards:
-            text = card.inner_text()
-            lines = [l.strip() for l in text.split("\n") if l.strip()]
-            title = lines[0] if lines else "Unknown"
+        # Find search result links/blocks
+        result_links = page.locator("a[href*='pageaction=viewjob'], .search-results-job-box, .job-search-result, table.table-jobs tr").all()
+        print(f"Found {len(result_links)} potential listing elements.")
 
-            # Check exclusion keywords
+        for item in result_links:
+            text = item.inner_text().strip()
+            if not text or len(text) < 15:
+                continue
+
             lower_text = text.lower()
-            if any(term.lower() in lower_text for term in MUST_NOT_CONTAIN):
+
+            # Filter out exclusions
+            if any(bad.lower() in lower_text for bad in MUST_NOT_CONTAIN):
                 continue
 
-            # Check inclusion keywords
-            if MUST_CONTAIN and not any(term.lower() in lower_text for term in MUST_CONTAIN):
+            # Inclusion criteria check
+            if MUST_CONTAIN and not any(good.lower() in lower_text for good in MUST_CONTAIN):
                 continue
+
+            # Extract URL if available
+            href = item.get_attribute("href") or ""
+            if href and not href.startswith("http"):
+                href = f"https://www.civilservicejobs.service.gov.uk{href}"
+
+            first_line = text.split("\n")[0].strip()
 
             jobs.append({
-                "Title": title,
-                "Details": " | ".join(lines[1:4]),
-                "Raw": text[:200].replace("\n", " ")
+                "Title": first_line,
+                "Link": href,
+                "Summary": " ".join([l.strip() for l in text.split("\n")[1:] if l.strip()])[:250]
             })
 
         browser.close()
 
-    # Save filtered output
+    # Save results
     with open("matched_jobs.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["Title", "Details", "Raw"])
+        writer = csv.DictWriter(f, fieldnames=["Title", "Link", "Summary"])
         writer.writeheader()
         writer.writerows(jobs)
 
-    print(f"\nCompleted! {len(jobs)} jobs matched your criteria. Saved to matched_jobs.csv")
+    print(f"Done. Saved {len(jobs)} matches to matched_jobs.csv.")
 
 if __name__ == "__main__":
     run()
